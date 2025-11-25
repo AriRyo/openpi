@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so101_policy as so101_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -452,6 +453,73 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotSO101DataConfig(DataConfigFactory):
+    """
+    Data config for SO101 LeRobot dataset with two cameras (front, above) and 6-dof actions
+    (5 joints as deltas, 1 gripper as absolute).
+    """
+
+    # Convert joint actions to deltas relative to current state; keep gripper absolute
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected if no prompt is present; otherwise load from task_index
+    default_prompt: str | None = None
+
+    # Map dataset fields to common names used by transforms/model
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # Images
+                        "observation/image": "observation.images.above",
+                        "observation/wrist_image": "observation.images.side",
+                        # Proprio
+                        "observation/state": "observation.state",
+                        # Actions
+                        "actions": "action",
+                        # Prompt may be injected via PromptFromLeRobotTask below
+                    }
+                )
+            ]
+        )
+    )
+
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Inputs/outputs shared at train + inference
+        data_transforms = _transforms.Group(
+            inputs=[so101_policy.SO101Inputs(model_type=model_config.model_type)],
+            outputs=[so101_policy.SO101Outputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            # First 5 joints as deltas, last 1 (gripper) absolute
+            delta_action_mask = _transforms.make_bool_mask(5, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Add optional default prompt and tokenizer/image resize/padding via ModelTransformFactory
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        base = self.create_base_config(assets_dirs, model_config)
+
+        # If the dataset contains tasks, let the loader derive prompt from task_index
+        base = dataclasses.replace(base, prompt_from_task=True)
+
+        return dataclasses.replace(
+            base,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -751,6 +819,99 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning SO101 (user-recorded) configs.
+    #
+    TrainConfig(
+        name="pi05_so101",
+        # pi0.5 model; adjust action_horizon to your chunk length if desired
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 default; we'll pad 6-dim controls
+            action_horizon=16,
+        ),
+        data=LeRobotSO101DataConfig(
+            # Set to your local LeRobot dataset root name (folder under ./data) or HF repo id
+            repo_id="AriRyo/pickplace-v3_merged",  # or "your_hf_username/record-pickplace"
+            # You can set default_prompt if you don't have tasks metadata; else leave None to use task_index
+            default_prompt=None,
+        ),
+        # Initialize from pi05 base weights (you can change to another starting checkpoint)
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # Training schedule; tune as needed
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=128,
+        num_train_steps=30_000,
+    ),
+    # Memory-lean full finetune for single 40GB GPU
+    TrainConfig(
+        name="pi05_so101_full_40g",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,  # shorter horizon reduces activations
+            # You can optionally reduce tokens: max_token_len=160,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="AriRyo/pickplace-v3_merged",
+            default_prompt=None,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Save memory: disable EMA to avoid a full copy of params
+        ema_decay=None,
+        # Conservative global batch size for ~40GB; increase if memory allows
+        batch_size=4,
+        num_train_steps=30_000,
+        # Keep FSDP on 1 device (single GPU). For multi-GPU, set fsdp_devices accordingly.
+        fsdp_devices=1,
+    ),
+    # LoRA finetune for single 40GB GPU (much more memory-friendly)
+    TrainConfig(
+        name="pi05_so101_lora_40g",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="AriRyo/pickplace-v3_merged",
+            default_prompt="Pick and Place the gray cube to circle on table",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        # Start at 16; increase to 24/32 if memory allows
+        batch_size=16,
+        num_train_steps=30_000,
+        # Freeze non-LoRA weights
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
     ),
     #
     # Fine-tuning Aloha configs.
